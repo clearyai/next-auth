@@ -1,0 +1,215 @@
+From ab0a2a5d7a26b7885f7cbb7285e087dabd3c04c4 Mon Sep 17 00:00:00 2001
+From: JibbityJobbity <jibbity@pm.me>
+Date: Mon, 22 Jan 2024 23:05:57 +1300
+Subject: [PATCH] fix(providers): Handle Azure AD tenants correctly
+
+The way Microsoft integrates their tenant system will change the underlying
+endpoints underneath the oauth/openid ones it provides. This works around
+the non-conformity and makes it functional.
+---
+ .../lib/actions/callback/oauth/callback.ts    | 14 +++++++--
+ .../lib/actions/signin/authorization-url.ts   |  9 ++++--
+ packages/core/src/lib/utils/providers.ts      |  2 +-
+ packages/core/src/providers/azure-ad.ts       | 30 +++++++++++++++++--
+ packages/core/src/providers/oauth.ts          | 25 +++++++++++-----
+ 5 files changed, 65 insertions(+), 15 deletions(-)
+
+diff --git a/packages/core/src/lib/actions/callback/oauth/callback.ts b/packages/core/src/lib/actions/callback/oauth/callback.ts
+index 375d3895dbb..f5549c672eb 100644
+--- a/packages/core/src/lib/actions/callback/oauth/callback.ts
++++ b/packages/core/src/lib/actions/callback/oauth/callback.ts
+@@ -1,3 +1,4 @@
++import * as jose from "jose"
+ import * as checks from "./checks.js"
+ import * as o from "oauth4webapi"
+ import {
+@@ -44,10 +45,15 @@ export async function handleOAuth(
+     // We assume that issuer is always defined as this has been asserted earlier
+     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+     const issuer = new URL(provider.issuer!)
+-    const discoveryResponse = await o.discoveryRequest(issuer)
++    let discoveryResponse: Response | undefined = await o.discoveryRequest(issuer)
++
++    if (provider.authorization?.conform) {
++      discoveryResponse = await provider.authorization?.conform(discoveryResponse);
++    }
++
+     const discoveredAs = await o.processDiscoveryResponse(
+       issuer,
+-      discoveryResponse
++      discoveryResponse!
+     )
+ 
+     if (!discoveredAs.token_endpoint)
+@@ -129,6 +135,10 @@ export async function handleOAuth(
+   let profile: Profile = {}
+   let tokens: TokenSet & Pick<Account, "expires_at">
+ 
++  if (provider.authorization?.serverConform) {
++    as = await provider.authorization?.serverConform(as, codeGrantResponse)
++  }
++
+   if (provider.type === "oidc") {
+     const nonce = await checks.nonce.use(cookies, resCookies, options)
+     const result = await o.processAuthorizationCodeOpenIDResponse(
+diff --git a/packages/core/src/lib/actions/signin/authorization-url.ts b/packages/core/src/lib/actions/signin/authorization-url.ts
+index 0c92e8299f0..58e9d9f651a 100644
+--- a/packages/core/src/lib/actions/signin/authorization-url.ts
++++ b/packages/core/src/lib/actions/signin/authorization-url.ts
+@@ -24,8 +24,13 @@ export async function getAuthorizationUrl(
+     // We check this in assert.ts
+     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+     const issuer = new URL(provider.issuer!)
+-    const discoveryResponse = await o.discoveryRequest(issuer)
+-    const as = await o.processDiscoveryResponse(issuer, discoveryResponse)
++    let discoveryResponse: Response | undefined = await o.discoveryRequest(issuer)
++
++    if (provider.authorization?.conform) {
++      discoveryResponse = await provider.authorization?.conform(discoveryResponse);
++    }
++
++    const as = await o.processDiscoveryResponse(issuer, discoveryResponse!)
+ 
+     if (!as.authorization_endpoint) {
+       throw new TypeError(
+diff --git a/packages/core/src/lib/utils/providers.ts b/packages/core/src/lib/utils/providers.ts
+index 87d1a840ec8..f8fddd2978c 100644
+--- a/packages/core/src/lib/utils/providers.ts
++++ b/packages/core/src/lib/utils/providers.ts
+@@ -149,5 +149,5 @@ function normalizeEndpoint(
+       url.searchParams.set(key, String(value))
+     }
+   }
+-  return { url, request: e?.request, conform: e?.conform }
++  return { url, request: e?.request, conform: e?.conform, serverConform: e?.serverConform }
+ }
+diff --git a/packages/core/src/providers/azure-ad.ts b/packages/core/src/providers/azure-ad.ts
+index 854fbbbc224..d36430b6fd5 100644
+--- a/packages/core/src/providers/azure-ad.ts
++++ b/packages/core/src/providers/azure-ad.ts
+@@ -9,6 +9,7 @@
+  * @module providers/azure-ad
+  */
+ import type { OAuthConfig, OAuthUserConfig } from "./index.js"
++import * as jose from "jose"
+ 
+ export interface AzureADProfile extends Record<string, any> {
+   sub: string
+@@ -121,7 +122,7 @@ export default function AzureAD<P extends AzureADProfile>(
+      */
+     profilePhotoSize?: 48 | 64 | 96 | 120 | 240 | 360 | 432 | 504 | 648
+     /** @default "common" */
+-    tenantId?: string
++    tenantId?: string,
+   }
+ ): OAuthConfig<P> {
+   const { tenantId = "common", profilePhotoSize = 48, ...rest } = options
+@@ -135,6 +136,31 @@ export default function AzureAD<P extends AzureADProfile>(
+       params: {
+         scope: "openid profile email User.Read",
+       },
++      async conform(response) {
++        // Microsoft being special and non-compliant #9635
++        //
++        // MS doesn't follow the spec for some common tenant
++        // ID's ("common", "organizations", "customers"), returning
++        // a different issuer URL than used to make the request.
++        if (response.status !== 200) return response
++
++        let json = await response.json()
++        json.issuer = rest.issuer;
++        return new Response(JSON.stringify(json), response)
++      },
++      async serverConform(authServer, codeGrantResponse) {
++        if (codeGrantResponse.status !== 200) return authServer
++
++        const { id_token } = await codeGrantResponse.clone().json()
++        const jwt: jose.JWTPayload & { tid?: string } = jose.decodeJwt(id_token)
++
++        return {
++          ...authServer,
++          issuer: jwt.tid
++            ? authServer.issuer.replace(tenantId, jwt.tid)
++            : authServer.issuer,
++        }
++      }
+     },
+     async profile(profile, tokens) {
+       // https://docs.microsoft.com/en-us/graph/api/profilephoto-get?view=graph-rest-1.0#examples
+@@ -151,7 +177,7 @@ export default function AzureAD<P extends AzureADProfile>(
+           const pictureBuffer = await response.arrayBuffer()
+           const pictureBase64 = Buffer.from(pictureBuffer).toString("base64")
+           image = `data:image/jpeg;base64, ${pictureBase64}`
+-        } catch {}
++        } catch { }
+       }
+ 
+       return {
+diff --git a/packages/core/src/providers/oauth.ts b/packages/core/src/providers/oauth.ts
+index 09a877cd42f..112fb2d8c9c 100644
+--- a/packages/core/src/providers/oauth.ts
++++ b/packages/core/src/providers/oauth.ts
+@@ -1,4 +1,4 @@
+-import type { Client } from "oauth4webapi"
++import type { Client, AuthorizationServer } from "oauth4webapi"
+ import type { CommonProviderOptions } from "../providers/index.js"
+ import type {
+   AuthConfig,
+@@ -50,6 +50,8 @@ interface AdvancedEndpointHandler<P extends UrlParams, C, R> {
+   request?: EndpointRequest<C, R, P>
+   /** @internal */
+   conform?: (response: Response) => Awaitable<Response | undefined>
++  /** @internal */
++  serverConform?: (server: AuthorizationServer, codeGrantResponse: Response) => Awaitable<AuthorizationServer>
+ }
+ 
+ /**
+@@ -62,8 +64,9 @@ export type EndpointHandler<
+   R = any,
+ > = AdvancedEndpointHandler<P, C, R>
+ 
+-export type AuthorizationEndpointHandler =
+-  EndpointHandler<AuthorizationParameters>
++export interface AuthorizationEndpointHandler extends
++  EndpointHandler<AuthorizationParameters> {
++}
+ 
+ export type TokenEndpointHandler = EndpointHandler<
+   UrlParams,
+@@ -109,7 +112,7 @@ export interface OAuthProviderButtonStyles {
+ /** TODO: Document */
+ export interface OAuth2Config<Profile>
+   extends CommonProviderOptions,
+-    PartialIssuer {
++  PartialIssuer {
+   /**
+    * Identifies the provider when you want to sign in to
+    * a specific provider.
+@@ -255,7 +258,13 @@ export type OAuthConfigInternal<Profile> = Omit<
+   OAuthConfig<Profile>,
+   OAuthEndpointType | "redirectProxyUrl"
+ > & {
+-  authorization?: { url: URL }
++  authorization?: {
++    url: URL
++    /** @internal */
++    serverConform?: AuthorizationEndpointHandler["serverConform"],
++    /** @internal */
++    conform?: AuthorizationEndpointHandler["conform"],
++  }
+   token?: {
+     url: URL
+     request?: TokenEndpointHandler["request"]
+@@ -276,9 +285,9 @@ export type OAuthConfigInternal<Profile> = Omit<
+    */
+   redirectProxyUrl?: OAuth2Config<Profile>["redirectProxyUrl"]
+ } & Pick<
+-    Required<OAuthConfig<Profile>>,
+-    "clientId" | "checks" | "profile" | "account"
+-  >
++  Required<OAuthConfig<Profile>>,
++  "clientId" | "checks" | "profile" | "account"
++>
+ 
+ export type OIDCConfigInternal<Profile> = OAuthConfigInternal<Profile> & {
+   checks: OIDCConfig<Profile>["checks"]
