@@ -1,6 +1,6 @@
 {
-  "name": "@auth/core",
-  "version": "0.28.0",
+  "name": "@clearyai/auth-core",
+  "version": "0.30.0-dev.1",
   "description": "Authentication for the Web.",
   "keywords": [
     "authentication",
